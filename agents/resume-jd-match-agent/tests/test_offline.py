@@ -378,7 +378,7 @@ class CacheTests(unittest.TestCase):
         self.assertFalse(os.path.exists(path))
 
     def test_cache_key_includes_model(self):
-        k1 = cache.key_for("Resume text", "JD text", model="gemini-2.5-flash")
+        k1 = cache.key_for("Resume text", "JD text", model="gemini-3.8-flash")
         k2 = cache.key_for("Resume text", "JD text", model="gemini-1.5-pro")
         self.assertNotEqual(k1, k2)
 

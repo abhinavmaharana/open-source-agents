@@ -9,8 +9,8 @@ import os
 from google.genai import types
 
 # --- Model & Generation Settings ---------------------------------------------
-MODEL_NAME = os.getenv("RESUME_JD_MODEL", "gemini-2.5-flash")
-OCR_MODEL = os.getenv("RESUME_JD_OCR_MODEL", "gemini-2.5-flash")
+MODEL_NAME = os.getenv("RESUME_JD_MODEL", "gemini-3.8-flash")
+OCR_MODEL = os.getenv("RESUME_JD_OCR_MODEL", "gemini-3.8-flash")
 OCR_ENABLED_ENV = "RESUME_JD_OCR"
 
 TEMPERATURE = float(os.getenv("RESUME_JD_TEMPERATURE", "0.2"))

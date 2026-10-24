@@ -42,7 +42,7 @@ Get a free API key at [Google AI Studio](https://aistudio.google.com/apikey). Wi
 
 - **Language & Runtime**: Python 3.10+ (tested on 3.11)
 - **Agent Framework / Core Library**: Google Agent Development Kit (`google-adk` 2.x)
-- **Models**: Gemini 2.5 Flash (`gemini-2.5-flash`) via the Gemini API (Google AI Studio key, not Vertex AI)
+- **Models**: Gemini 3.8 Flash (`gemini-3.8-flash`) via the Gemini API (Google AI Studio key, not Vertex AI)
 - **External APIs / Tools**: `pypdf` for PDF text extraction. Everything else is the Python standard library: `.docx` parsing, PDF export, the report cache, two ADK tools and three callbacks. No other dependencies.
 
 ---
@@ -64,7 +64,7 @@ Get a free API key at [Google AI Studio](https://aistudio.google.com/apikey). Wi
    4. follow-up turn (e.g. cover letter)? -> re-attach resume + JD from session state
               |
               v
- [Gemini 2.5 Flash] .............................. request 1: writes the report
+ [Gemini 3.8 Flash] .............................. request 1: writes the report
         (unusual phrasings or several JDs: Gemini first calls analyze_match or
          rank_job_descriptions = request 1, then writes the report = request 2)
               |
@@ -220,8 +220,8 @@ Then add your key to `resume_jd_agent/.env` as above.
 | `RESUME_JD_OCR` | No | `on` | `off` never sends scanned PDFs to Gemini; they are rejected instead |
 | `RESUME_JD_ALLOW_FILE_PATHS` | No | `on` | `off` disables reading files by system path (security setting for shared servers) |
 | `RESUME_JD_ALLOWED_DIRS` | No | *None* | Comma- or colon-separated list of directories permitted for file path inputs |
-| `RESUME_JD_MODEL` | No | `gemini-2.5-flash` | Main Gemini model used for match reports and cover letters |
-| `RESUME_JD_OCR_MODEL` | No | `gemini-2.5-flash` | Model used for OCR fallback on scanned PDFs |
+| `RESUME_JD_MODEL` | No | `gemini-3.8-flash` | Main Gemini model used for match reports and cover letters |
+| `RESUME_JD_OCR_MODEL` | No | `gemini-3.8-flash` | Model used for OCR fallback on scanned PDFs |
 | `RESUME_JD_CACHE_DIR` | No | `resume_jd_agent/.cache/reports` | Directory where cached reports are saved with 0600 permissions |
 
 All settings live centrally in **`resume_jd_agent/config.py`**, versioned and reviewed:
@@ -500,7 +500,7 @@ adk web
 - **Keyword matching is heuristic.** ~175 built-in skills with aliases, plus capitalised tools, acronyms and certifications from JD bullet lines. Lower-case jargon that is not in the list, and synonyms (e.g. "experimentation" vs "split tests"), can still be missed by the tool; Gemini partly compensates when scoring.
 - **Not a real ATS.** Workday, Greenhouse, Lever and others parse and rank differently. The score is guidance, not a pass/fail prediction. Ranking uses keyword overlap only.
 - **New reports vary slightly.** Temperature is 0.2, so a fresh run of a new resume + JD can differ by a few points; the cache makes repeats identical.
-- **Free-tier limits.** 5 requests per minute and 20 per day for `gemini-2.5-flash` at the time of writing ([rate limits](https://ai.google.dev/gemini-api/docs/rate-limits)): about 20 new reports a day, with unlimited cached repeats.
+- **Free-tier limits.** 5 requests per minute and 20 per day for `gemini-3.8-flash` at the time of writing ([rate limits](https://ai.google.dev/gemini-api/docs/rate-limits)): about 20 new reports a day, with unlimited cached repeats.
 - **Guardrails flag, they do not rewrite.** The skill-claim check only knows the skill list, and a cover letter can still overstate soft claims ("strong track record"). Read flagged items and the letter before you send anything.
 - **OCR** sends the scanned PDF to Gemini (1 request) and can misread names or numbers; the report warns when it was used.
 - **PDF export** uses the built-in Helvetica font, so characters outside Western European scripts are replaced with `?`. Use the Markdown output for other scripts.
