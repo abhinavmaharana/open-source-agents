@@ -4,12 +4,22 @@ Every function returns a dict with a "status" key so the LLM can tell
 success from failure. All logic here is deterministic: no network calls.
 """
 
-import io
 import os
 import re
 
 from google.adk.tools import ToolContext
-from pypdf import PdfReader
+
+from . import cache
+from .documents import (  # noqa: F401  (MAX_* re-exported for callers and tests)
+    MAX_DOC_CHARS,
+    MAX_FILE_BYTES,
+    MAX_PDF_PAGES,
+    limit_text,
+    looks_like_path,
+    read_bytes,
+    read_path,
+    unsupported_file_error,
+)
 
 # Canonical skill -> extra spellings that should count as the same skill.
 # Matching is case-insensitive and on word boundaries.
@@ -223,13 +233,15 @@ def _variant_pattern(term: str) -> re.Pattern:
     return re.compile(r"(?<![a-z0-9])" + re.escape(term) + r"(?![a-z0-9])")
 
 
-_SKILL_PATTERNS: list[tuple[str, list[re.Pattern]]] = [
-    (skill, [_variant_pattern(v) for v in [skill, *variants]])
+# Each entry is (variant, pattern). The plain-substring check on `variant` runs
+# first and is ~10x cheaper than the regex, so most patterns never execute.
+_SKILL_PATTERNS: list[tuple[str, list[tuple[str, re.Pattern]]]] = [
+    (skill, [(v, _variant_pattern(v)) for v in [skill, *variants]])
     for skill, variants in SKILLS.items()
 ]
 
-_CASE_SENSITIVE_PATTERNS: list[tuple[str, list[re.Pattern]]] = [
-    (skill, [re.compile(r"(?<![A-Za-z0-9])" + re.escape(v) + r"(?![A-Za-z0-9])") for v in variants])
+_CASE_SENSITIVE_PATTERNS: list[tuple[str, list[tuple[str, re.Pattern]]]] = [
+    (skill, [(v, re.compile(r"(?<![A-Za-z0-9])" + re.escape(v) + r"(?![A-Za-z0-9])")) for v in variants])
     for skill, variants in CASE_SENSITIVE_ALIASES.items()
 ]
 
@@ -248,12 +260,12 @@ def _skill_matches(text: str) -> list[str]:
     found = {
         skill
         for skill, patterns in _SKILL_PATTERNS
-        if any(p.search(normalised) for p in patterns)
+        if any(v in normalised and p.search(normalised) for v, p in patterns)
     }
     found |= {
         skill
         for skill, patterns in _CASE_SENSITIVE_PATTERNS
-        if any(p.search(text) for p in patterns)
+        if any(v in text and p.search(text) for v, p in patterns)
     }
     return sorted(found)
 
@@ -270,91 +282,81 @@ def _capitalised_phrases(text: str) -> list[str]:
     return sorted(phrases)
 
 
-def read_resume(source: str) -> dict:
-    """Reads a resume from a PDF file path or returns pasted resume text.
+# Words that are capitalised in JDs but are not skills (titles, perks, fillers).
+_GENERIC_JD_WORDS = set("""
+experience strong excellent working knowledge familiarity exposure hands-on years total including
+team teams product products platform platforms manager managers senior junior associate lead engineer
+engineers role company customers merchants users business competitive salary health insurance hybrid
+remote work setup degree computer science background former technical skills plus bonus qualifications
+offer annual learning budget culture certification sponsorship family esops sde pm apm ii iii iv qa vp
+""".split())
+_JD_WORD = r"[A-Z][A-Za-z0-9+#./-]*[A-Za-z0-9+#]|[A-Z]{2,}"
+_JD_PHRASE_RE = re.compile(rf"(?<![\w./-])((?:{_JD_WORD})(?: (?:{_JD_WORD}))*)(?![\w])")
+_SKILL_WORDS = {w for skill, variants in SKILLS.items() for v in [skill, *variants] for w in v.split()}
 
-    Use this first whenever the user provides a resume. If `source` is a path
-    ending in .pdf (or .txt) that exists on disk, the file is read. Otherwise
-    `source` itself is treated as the pasted resume text.
+
+def jd_specific_terms(jd_text: str) -> list[str]:
+    """Finds tools, certifications and acronyms in JD bullets that are NOT in
+    the built-in skill list, e.g. "Stripe", "HIPAA", "CKA", "Core Web Vitals".
+
+    Only bullet lines are scanned (requirements and responsibilities), the first
+    word of each bullet is skipped (sentence case), and generic words such as
+    titles and perks are dropped. Output is a hint list for the model.
+    """
+    terms: dict[str, str] = {}
+    for line in jd_text.splitlines():
+        line = line.strip()
+        if not re.match(r"^[-*•]\s", line):
+            continue
+        body = re.sub(r"^[-*•]\s+", "", line)
+        for match in _JD_PHRASE_RE.finditer(body):
+            words = match.group(1).rstrip(".").split()
+            if match.start() == 0 and not words[0].isupper():
+                words = words[1:]  # "Experience with ..." is sentence case; "HIPAA ..." is not
+            words = [w for w in words if w.lower() not in _GENERIC_JD_WORDS]
+            term = " ".join(words)
+            if not term or _skill_matches(term) or term.lower() in _SKILL_WORDS:
+                continue
+            terms.setdefault(term.lower(), term)
+    return sorted(terms.values(), key=str.lower)
+
+
+def _terms_missing_from(resume_text: str, terms: list[str]) -> list[str]:
+    """Terms whose words do not all appear (as whole words) in the resume."""
+    normalised = _normalise(resume_text)
+    return [
+        term for term in terms
+        if not all(_variant_pattern(word).search(normalised) for word in _normalise(term).split())
+    ]
+
+
+def read_resume(source: str) -> dict:
+    """Reads a resume from a file path or returns pasted resume text.
+
+    If `source` is a path ending in .pdf, .docx, .txt or .md, the file is read
+    (scanned PDFs are OCR'd). Otherwise `source` itself is the pasted text.
 
     Args:
-        source: A path to a .pdf or .txt resume file, or the raw resume text.
+        source: A path to a resume file, or the raw resume text.
 
     Returns:
         dict: {"status": "success", "text": <resume text>} on success, or
         {"status": "error", "error_message": <reason>} on failure.
     """
     if source is None or not source.strip():
-        return {"status": "error", "error_message": "No resume provided. Ask the user for a PDF path or pasted text."}
-
-    if _looks_like_path(source):
-        candidate = os.path.expanduser(source.strip().strip('"').strip("'"))
-        if not os.path.isfile(candidate):
-            return {"status": "error", "error_message": f"File not found: {candidate}"}
-        if os.path.getsize(candidate) > MAX_FILE_BYTES:
-            return {"status": "error", "error_message": f"File is larger than {MAX_FILE_BYTES // 1_000_000} MB."}
-        if candidate.lower().endswith(".pdf"):
-            return _pdf_to_text(candidate)
-        with open(candidate, encoding="utf-8", errors="replace") as f:
-            return _limit_text(f.read())
-
-    return _limit_text(source)
-
-
-# Guardrails on input size. A typical resume is 3,000-10,000 characters; the
-# caps stop a huge paste or a 200-page PDF from burning the token quota.
-MAX_FILE_BYTES = 5_000_000
-MAX_PDF_PAGES = 10
-MAX_DOC_CHARS = 20_000
-
-
-def _limit_text(text: str) -> dict:
-    """Strips text and truncates it to MAX_DOC_CHARS, flagging truncation."""
-    text = text.strip()
-    if not text:
-        return {"status": "error", "error_message": "The document is empty."}
-    if len(text) > MAX_DOC_CHARS:
-        return {"status": "success", "text": text[:MAX_DOC_CHARS], "truncated": True}
-    return {"status": "success", "text": text}
-
-
-def _pdf_to_text(stream) -> dict:
-    """Extracts text from a PDF path or binary stream with pypdf."""
-    try:
-        reader = PdfReader(stream)
-        if len(reader.pages) > MAX_PDF_PAGES:
-            return {
-                "status": "error",
-                "error_message": f"The PDF has {len(reader.pages)} pages; the limit is {MAX_PDF_PAGES}. Upload only the resume.",
-            }
-        text = "\n".join((page.extract_text() or "") for page in reader.pages).strip()
-    except Exception as exc:  # pypdf raises several error types
-        return {"status": "error", "error_message": f"Could not read PDF: {exc}"}
-    if not text:
-        return {
-            "status": "error",
-            "error_message": "The PDF has no extractable text (it may be a scanned image). Ask the user to paste the text instead.",
-        }
-    return _limit_text(text)
+        return {"status": "error", "error_message": "No resume provided. Ask the user for a file or pasted text."}
+    if looks_like_path(source):
+        return read_path(source)
+    return unsupported_file_error(source) or limit_text(source)
 
 
 def uploaded_file_to_text(data: bytes, mime_type: str) -> dict:
-    """Converts an uploaded file (from the adk web paperclip button) to text.
+    """Converts an uploaded file (from the adk web attach button) to text.
 
     Not an LLM tool: guardrails.py calls it on attached files before the model
-    runs. Supports PDF and plain-text files.
+    runs. Supports PDF (including scanned, via OCR), .docx and plain text.
     """
-    if len(data) > MAX_FILE_BYTES:
-        return {"status": "error", "error_message": f"File is larger than {MAX_FILE_BYTES // 1_000_000} MB."}
-    mime_type = (mime_type or "").lower()
-    if mime_type == "application/pdf":
-        return _pdf_to_text(io.BytesIO(data))
-    if mime_type.startswith("text/"):
-        return _limit_text(data.decode("utf-8", errors="replace"))
-    return {
-        "status": "error",
-        "error_message": f"Unsupported file type '{mime_type}'. Upload a PDF or .txt file, or paste the text.",
-    }
+    return read_bytes(data, mime_type)
 
 
 def extract_keywords(text: str) -> dict:
@@ -401,8 +403,9 @@ def keyword_overlap(resume_text: str, jd_text: str) -> dict:
                "missing": JD skills absent from the resume,
                "resume_only": resume skills the JD does not mention,
                "overlap_percent": matched / JD skills * 100,
-               "jd_phrases_not_in_resume": capitalised JD phrases (e.g. tool
-               or product names) that never appear in the resume text}
+               "jd_terms_not_in_resume": JD-specific tools, certifications and
+               acronyms outside the skill list (e.g. "Stripe", "HIPAA") that the
+               resume never mentions}
     """
     resume = extract_keywords(resume_text)
     jd = extract_keywords(jd_text)
@@ -417,8 +420,7 @@ def keyword_overlap(resume_text: str, jd_text: str) -> dict:
     missing = sorted(jd_skills - resume_skills)
     overlap = round(100 * len(matched) / len(jd_skills), 1) if jd_skills else 0.0
 
-    resume_lower = _normalise(resume_text)
-    phrases_missing = [p for p in jd["phrases"] if _normalise(p).strip() not in resume_lower]
+    jd_terms_missing = _terms_missing_from(resume_text, jd_specific_terms(jd_text))
 
     return {
         "status": "success",
@@ -427,13 +429,17 @@ def keyword_overlap(resume_text: str, jd_text: str) -> dict:
         "resume_only": sorted(resume_skills - jd_skills),
         "overlap_percent": overlap,
         "jd_skill_count": len(jd_skills),
-        "jd_phrases_not_in_resume": phrases_missing,
+        "jd_terms_not_in_resume": jd_terms_missing,
     }
 
 
 UPLOAD_PREFIX = "upload:"
 UPLOADS_STATE_KEY = "uploads"
 RESUME_STATE_KEY = "resume_text"
+MISSING_STATE_KEY = "missing_skills"
+JD_STATE_KEY = "jd_text"
+# temp: keys live for one turn only; used to cache the report this turn produces.
+CACHE_KEY_STATE = "temp:report_cache_key"
 
 
 def _resolve_document(source: str, uploads: dict) -> dict:
@@ -446,14 +452,8 @@ def _resolve_document(source: str, uploads: dict) -> dict:
         return {"status": "success", "text": uploads[name], "from": "upload"}
     result = read_resume(source)
     if result["status"] == "success":
-        result["from"] = "file" if _looks_like_path(source) else "pasted"
+        result["from"] = "file" if looks_like_path(source) else "pasted"
     return result
-
-
-def _looks_like_path(source: str) -> bool:
-    """True when read_resume will treat `source` as a file path, not text."""
-    candidate = source.strip().strip('"').strip("'")
-    return candidate.lower().endswith((".pdf", ".txt")) and "\n" not in candidate
 
 
 def analyze_match(resume: str, job_description: str, tool_context: ToolContext) -> dict:
@@ -465,7 +465,7 @@ def analyze_match(resume: str, job_description: str, tool_context: ToolContext) 
         resume: How to find the resume. One of:
             - "upload:<file name>" for a file the user uploaded (preferred:
               never copy uploaded text into this argument),
-            - a path to a .pdf or .txt file,
+            - a path to a .pdf, .docx, .txt or .md file,
             - the full resume text, only if the user pasted it.
         job_description: How to find the JD, in the same three forms.
         tool_context: Injected by ADK; holds uploaded files in session state.
@@ -493,8 +493,12 @@ def analyze_match(resume: str, job_description: str, tool_context: ToolContext) 
             "error_message": "The job description contains no recognisable skills. Ask the user to check it is a real JD.",
         }
 
-    # Kept for the output guardrail that blocks invented numbers in rewrites.
+    # Kept for the output guardrails (invented numbers, unsupported skill claims)
+    # and for the report cache.
     tool_context.state[RESUME_STATE_KEY] = resume_doc["text"]
+    tool_context.state[JD_STATE_KEY] = jd_doc["text"]
+    tool_context.state[MISSING_STATE_KEY] = overlap["missing"]
+    tool_context.state[CACHE_KEY_STATE] = cache.key_for(resume_doc["text"], jd_doc["text"])
 
     result = {"status": "success", "overlap": overlap, "warnings": []}
     # Only return text the model has not already seen, to save tokens.
@@ -505,4 +509,67 @@ def analyze_match(resume: str, job_description: str, tool_context: ToolContext) 
     for label, doc in (("Resume", resume_doc), ("Job description", jd_doc)):
         if doc.get("truncated"):
             result["warnings"].append(f"{label} was longer than {MAX_DOC_CHARS} characters and was truncated.")
+        if doc.get("ocr"):
+            result["warnings"].append(f"{label} was a scanned PDF and was read with OCR; check names and numbers.")
     return result
+
+
+def _label(source: str, index: int) -> str:
+    source = source.strip()
+    if source.startswith(UPLOAD_PREFIX):
+        return source[len(UPLOAD_PREFIX):]
+    if looks_like_path(source):
+        return os.path.basename(source.strip("'\""))
+    return f"JD {index}"
+
+
+def rank_job_descriptions(resume: str, job_descriptions: list[str], tool_context: ToolContext) -> dict:
+    """Ranks several job descriptions by how well the resume matches each one.
+
+    Use this INSTEAD of analyze_match when the user gives 2 or more JDs. Call it
+    once; it also returns the full analysis for the best-matching JD.
+
+    Args:
+        resume: The resume, in the same forms as analyze_match ("upload:<name>",
+            a file path, or pasted text).
+        job_descriptions: 2-10 JDs, each "upload:<name>", a file path, or text.
+        tool_context: Injected by ADK.
+
+    Returns:
+        dict: {"status": "success", "ranking": [{"rank", "jd", "index", "overlap_percent",
+        "matched", "missing", "jd_terms_not_in_resume"}, ...] best first,
+        "best": <analyze_match result for the top JD>}, or an error.
+    """
+    if not 2 <= len(job_descriptions) <= 10:
+        return {"status": "error", "error_message": "Give between 2 and 10 job descriptions to rank."}
+    uploads = tool_context.state.get(UPLOADS_STATE_KEY, {}) or {}
+    resume_doc = _resolve_document(resume, uploads)
+    if resume_doc["status"] != "success":
+        return {"status": "error", "error_message": f"Resume: {resume_doc['error_message']}"}
+
+    rows = []
+    for index, source in enumerate(job_descriptions, 1):
+        jd_doc = _resolve_document(source, uploads)
+        label = _label(source, index)
+        if jd_doc["status"] != "success":
+            rows.append({"jd": label, "index": index, "error": jd_doc["error_message"], "overlap_percent": -1, "source": source})
+            continue
+        overlap = keyword_overlap(resume_doc["text"], jd_doc["text"])
+        rows.append({
+            "jd": label,
+            "index": index,
+            "overlap_percent": overlap.get("overlap_percent", 0),
+            "matched": len(overlap.get("matched", [])),
+            "missing": overlap.get("missing", [])[:8],
+            "jd_terms_not_in_resume": overlap.get("jd_terms_not_in_resume", [])[:5],
+            "source": source,
+        })
+    rows.sort(key=lambda row: row["overlap_percent"], reverse=True)
+    if rows[0]["overlap_percent"] < 0:
+        return {"status": "error", "error_message": "None of the job descriptions could be read."}
+
+    best = analyze_match(resume, rows[0]["source"], tool_context)
+    for rank, row in enumerate(rows, 1):
+        row["rank"] = rank
+        row.pop("source")
+    return {"status": "success", "ranking": rows, "best_jd": rows[0]["jd"], "best": best}

@@ -39,3 +39,6 @@ Thumbs.db
 
 # ADK local session storage (chat history, may contain resume data)
 .adk/
+
+# Local report cache (contains resume details)
+.cache/
