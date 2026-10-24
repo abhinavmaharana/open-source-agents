@@ -7,11 +7,14 @@ Run from agents/resume-jd-match-agent/:
 import asyncio
 import io
 import os
+import stat
 import sys
 import tempfile
+import time
 import unittest
 import zipfile
 from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -22,7 +25,7 @@ from google.genai import types  # noqa: E402
 os.environ["RESUME_JD_CACHE"] = "off"  # tests never touch the real report cache
 os.environ["RESUME_JD_OCR"] = "off"  # and never call Gemini
 
-from resume_jd_agent import cache, documents, guardrails, tools  # noqa: E402
+from resume_jd_agent import cache, config, documents, guardrails, tools  # noqa: E402
 
 
 def before(ctx, request):
@@ -31,6 +34,7 @@ def before(ctx, request):
 
 def after(ctx, response):
     return asyncio.run(guardrails.after_model_guardrail(ctx, response))
+
 
 RESUME = os.path.join(ROOT, "samples", "sample_resume.txt")
 JD = os.path.join(ROOT, "samples", "sample_jd.txt")
@@ -106,7 +110,10 @@ def user_request(*parts):
 
 
 def report(after_line):
-    text = "\n".join(guardrails.REQUIRED_HEADINGS[:3]) + f"\n## 4. Bullet Rewrites\n{after_line}\n## 5. Top 3 Fixes Before Applying\n1. a"
+    text = (
+        "\n".join(guardrails.REQUIRED_HEADINGS[:3])
+        + f"\n## 4. Bullet Rewrites\n{after_line}\n## 5. Top 3 Fixes Before Applying\n1. a"
+    )
     return LlmResponse(content=types.Content(role="model", parts=[types.Part(text=text)]))
 
 
@@ -157,7 +164,9 @@ class GuardrailTests(unittest.TestCase):
         self.assertNotIn("Rewrite 1 adds", out)
 
     def test_missing_section_is_flagged(self):
-        response = LlmResponse(content=types.Content(role="model", parts=[types.Part(text="## 1. Match Score\n**80/100**")]))
+        response = LlmResponse(
+            content=types.Content(role="model", parts=[types.Part(text="## 1. Match Score\n**80/100**")])
+        )
         out = after(fake_context(), response).content.parts[0].text
         self.assertIn("missing sections", out)
 
@@ -198,7 +207,9 @@ class FastPathTests(unittest.TestCase):
 
     def test_two_uploads_named_by_role(self):
         ctx = fake_context()
-        request = request_with_tool(types.Part(text="see files"), upload("my_cv.txt", RESUME), upload("job_post.txt", JD))
+        request = request_with_tool(
+            types.Part(text="see files"), upload("my_cv.txt", RESUME), upload("job_post.txt", JD)
+        )
         self.assert_fast_path(request, ctx)
 
     def test_missing_file_answered_locally(self):
@@ -215,7 +226,9 @@ class FastPathTests(unittest.TestCase):
         ctx = fake_context({tools.RESUME_STATE_KEY: "Resume body", tools.JD_STATE_KEY: "JD body"})
         request = request_with_tool(types.Part(text="Resume: a.txt Job description: b.txt"))
         request.contents.append(types.Content(role="model", parts=[types.Part(text="## 1. Match Score")]))
-        request.contents.append(types.Content(role="user", parts=[types.Part(text="Write a cover letter for this job.")]))
+        request.contents.append(
+            types.Content(role="user", parts=[types.Part(text="Write a cover letter for this job.")])
+        )
         self.assertIsNone(before(ctx, request))
         texts = " ".join(p.text for p in request.contents[-1].parts)
         self.assertIn("<<<DOCUMENT resume>>>\nResume body", texts)
@@ -228,13 +241,14 @@ class FastPathTests(unittest.TestCase):
         self.assertEqual(guardrails._upload_text.cache_info().misses, 1)
 
 
-def make_docx(paragraphs):
+def make_docx(paragraphs, preamble=""):
     """Builds a minimal .docx in memory (a zip with word/document.xml)."""
     ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
     body = "".join(f"<w:p><w:r><w:t>{p}</w:t></w:r></w:p>" for p in paragraphs)
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
-        archive.writestr("word/document.xml", f'<w:document xmlns:w="{ns}"><w:body>{body}</w:body></w:document>')
+        doc_xml = f'{preamble}<w:document xmlns:w="{ns}"><w:body>{body}</w:body></w:document>'
+        archive.writestr("word/document.xml", doc_xml)
     return buffer.getvalue()
 
 
@@ -285,7 +299,10 @@ class DocumentTests(unittest.TestCase):
 
 class JdTermTests(unittest.TestCase):
     def test_terms_outside_skill_list(self):
-        jd = "About us\n- Experience with Stripe or Razorpay.\n- Hands-on AWS (EC2, IAM, RDS).\n- HIPAA and SOC 2 exposure."
+        jd = (
+            "About us\n- Experience with Stripe or Razorpay.\n"
+            "- Hands-on AWS (EC2, IAM, RDS).\n- HIPAA and SOC 2 exposure."
+        )
         terms = tools.jd_specific_terms(jd)
         for expected in ["Stripe", "Razorpay", "EC2", "IAM", "RDS", "HIPAA", "SOC"]:
             self.assertIn(expected, terms)
@@ -340,6 +357,31 @@ class CacheTests(unittest.TestCase):
         cache.put("k", "report")
         self.assertIsNone(cache.get("k"))
 
+    def test_cache_file_permissions(self):
+        key = cache.key_for("Test permissions", "JD text")
+        cache.put(key, "Report with sensitive data")
+        path = cache._path(key)
+        self.assertTrue(os.path.exists(path))
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        self.assertEqual(mode, 0o600)  # readable and writable only by user
+
+    def test_cache_pruning(self):
+        key = cache.key_for("Old resume", "Old JD")
+        cache.put(key, "Old report")
+        path = cache._path(key)
+        self.assertTrue(os.path.exists(path))
+        # Set file modification time to 31 days ago
+        old_time = time.time() - (31 * 24 * 3600)
+        os.utime(path, (old_time, old_time))
+        pruned = cache.prune(max_age_seconds=30 * 24 * 3600)
+        self.assertGreaterEqual(pruned, 1)
+        self.assertFalse(os.path.exists(path))
+
+    def test_cache_key_includes_model(self):
+        k1 = cache.key_for("Resume text", "JD text", model="gemini-2.5-flash")
+        k2 = cache.key_for("Resume text", "JD text", model="gemini-1.5-pro")
+        self.assertNotEqual(k1, k2)
+
 
 class OutputGuardrailTests(unittest.TestCase):
     def test_numbers_compared_by_value(self):
@@ -357,6 +399,72 @@ class OutputGuardrailTests(unittest.TestCase):
         self.assertIn("by 18%", out)
         self.assertIn("[X%]", out)
         self.assertNotIn("40%", out)
+
+
+class SecurityTests(unittest.TestCase):
+    def test_file_paths_disabled(self):
+        with patch.dict(os.environ, {config.ALLOW_FILE_PATHS_ENV: "off"}):
+            result = tools.read_resume(RESUME)
+            self.assertEqual(result["status"], "error")
+            self.assertIn("disabled", result["error_message"].lower())
+
+    def test_allowed_folders_permitted(self):
+        samples_dir = os.path.dirname(RESUME)
+        with patch.dict(os.environ, {config.ALLOWED_DIRS_ENV: samples_dir}):
+            result = tools.read_resume(RESUME)
+            self.assertEqual(result["status"], "success")
+
+    def test_allowed_folders_rejected(self):
+        with tempfile.TemporaryDirectory() as safe_dir:
+            with patch.dict(os.environ, {config.ALLOWED_DIRS_ENV: safe_dir}):
+                result = tools.read_resume(RESUME)
+                self.assertEqual(result["status"], "error")
+                self.assertIn("outside allowed folders", result["error_message"])
+
+    def test_path_traversal_blocked(self):
+        with tempfile.TemporaryDirectory() as safe_dir:
+            traversal_path = os.path.join(safe_dir, "..", "..", os.path.basename(RESUME))
+            with patch.dict(os.environ, {config.ALLOWED_DIRS_ENV: safe_dir}):
+                self.assertFalse(documents.is_path_allowed(traversal_path))
+
+    def test_docx_entity_guard(self):
+        xxe_preamble = '<!DOCTYPE test [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]>'
+        malicious_docx = make_docx(["Testing"], preamble=xxe_preamble)
+        result = tools.uploaded_file_to_text(malicious_docx, documents.DOCX_MIME)
+        self.assertEqual(result["status"], "error")
+        self.assertIn("entity declarations", result["error_message"].lower())
+
+
+class ReliabilityTests(unittest.TestCase):
+    def test_before_guardrail_exception_resilience(self):
+        ctx = fake_context()
+        request = user_request(types.Part(text="Resume: a.txt Job description: b.txt"))
+        with patch("resume_jd_agent.guardrails._convert_uploads", side_effect=RuntimeError("Unexpected")):
+            # Must not raise; should return None and let request proceed
+            response = before(ctx, request)
+            self.assertIsNone(response)
+
+    def test_after_guardrail_exception_resilience(self):
+        ctx = fake_context()
+        raw_response = LlmResponse(content=types.Content(role="model", parts=[types.Part(text="## 1. Match Score")]))
+        with patch("resume_jd_agent.guardrails._scrub_invented_numbers", side_effect=RuntimeError("Unexpected")):
+            # Must not raise; should return raw_response
+            response = after(ctx, raw_response)
+            self.assertEqual(response, raw_response)
+
+    def test_analyze_match_exception_resilience(self):
+        ctx = fake_context()
+        with patch("resume_jd_agent.tools._resolve_document", side_effect=Exception("Disk failure")):
+            result = tools.analyze_match(RESUME, JD, ctx)
+            self.assertEqual(result["status"], "error")
+            self.assertIn("Unable to analyze match", result["error_message"])
+
+    def test_rank_job_descriptions_exception_resilience(self):
+        ctx = fake_context()
+        with patch("resume_jd_agent.tools._resolve_document", side_effect=Exception("Disk failure")):
+            result = tools.rank_job_descriptions(RESUME, [JD, JD], ctx)
+            self.assertEqual(result["status"], "error")
+            self.assertIn("Unable to rank", result["error_message"])
 
 
 if __name__ == "__main__":

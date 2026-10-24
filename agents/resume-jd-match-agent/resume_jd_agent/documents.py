@@ -6,6 +6,7 @@ the only function here that calls the network (and uses one API request).
 
 import functools
 import io
+import logging
 import os
 import re
 import unicodedata
@@ -13,18 +14,22 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 from pypdf import PdfReader
+from pypdf.errors import PdfReadError
 
-# Guardrails on input size. A typical resume is 3,000-10,000 characters; the
-# caps stop a huge paste or a 200-page PDF from burning the token quota.
-MAX_FILE_BYTES = 5_000_000
-MAX_PDF_PAGES = 10
-MAX_DOC_CHARS = 20_000
+from . import config
 
-SUPPORTED_EXTENSIONS = (".pdf", ".docx", ".txt", ".md")
-DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+logger = logging.getLogger("resume_jd_agent.documents")
 
-OCR_MODEL = "gemini-2.5-flash"
-OCR_ENABLED_ENV = "RESUME_JD_OCR"  # set to "off" to never call Gemini for scanned PDFs
+# Guardrails on input size from config (re-exported for callers and tests).
+MAX_FILE_BYTES = config.MAX_FILE_BYTES
+MAX_PDF_PAGES = config.MAX_PDF_PAGES
+MAX_DOC_CHARS = config.MAX_DOC_CHARS
+
+SUPPORTED_EXTENSIONS = config.SUPPORTED_EXTENSIONS
+DOCX_MIME = config.DOCX_MIME
+
+OCR_MODEL = config.OCR_MODEL
+OCR_ENABLED_ENV = config.OCR_ENABLED_ENV
 
 
 def limit_text(text: str) -> dict:
@@ -58,17 +63,26 @@ def repair_pdf_text(text: str) -> str:
 
 
 def _ocr_pdf(data: bytes) -> dict:
-    """Transcribes a scanned/image-only PDF with Gemini (1 API request)."""
+    """Transcribes a scanned/image-only PDF with Gemini (1 API request).
+
+    Retries on 429/5xx errors using the central retry configuration.
+    """
     if os.getenv(OCR_ENABLED_ENV, "").lower() == "off" or not os.getenv("GOOGLE_API_KEY"):
         return {
             "status": "error",
-            "error_message": "The PDF has no extractable text (it is probably a scanned image). Paste the text instead.",
+            "error_message": (
+                "The PDF has no extractable text (it is probably a scanned image). "
+                "Paste the text instead."
+            ),
         }
+    logger.info("Running Gemini OCR on scanned PDF (%d bytes)", len(data))
     try:
         from google import genai
         from google.genai import types
+        from google.genai.errors import APIError
 
-        client = genai.Client()  # keep a reference: a temporary client is closed before the call
+        # Configure the OCR client with the exact same retry options as the main agent model
+        client = genai.Client(http_options=types.HttpOptions(retry_options=config.RETRY_OPTIONS))
         response = client.models.generate_content(
             model=OCR_MODEL,
             contents=[
@@ -81,10 +95,13 @@ def _ocr_pdf(data: bytes) -> dict:
             ),
         )
         text = (response.text or "").strip()
-    except Exception as exc:  # network, quota or API errors
+    except (APIError, OSError, ValueError, RuntimeError) as exc:  # network, quota, or API errors
+        logger.warning("OCR failed to process PDF: %s", exc)
         return {"status": "error", "error_message": f"The PDF looks scanned and OCR failed: {exc}"}
     if not text:
+        logger.warning("OCR returned empty text for PDF (%d bytes)", len(data))
         return {"status": "error", "error_message": "The PDF looks scanned and OCR found no text."}
+    logger.info("OCR completed successfully (%d characters extracted)", len(text))
     result = limit_text(text)
     result["ocr"] = True
     return result
@@ -102,10 +119,14 @@ def read_pdf_bytes(data: bytes) -> dict:
         if len(reader.pages) > MAX_PDF_PAGES:
             return {
                 "status": "error",
-                "error_message": f"The PDF has {len(reader.pages)} pages; the limit is {MAX_PDF_PAGES}. Upload only the resume.",
+                "error_message": (
+                    f"The PDF has {len(reader.pages)} pages; the limit is {MAX_PDF_PAGES}. "
+                    "Upload only the resume."
+                ),
             }
         text = "\n".join((page.extract_text() or "") for page in reader.pages)
-    except Exception as exc:  # pypdf raises several error types
+    except (PdfReadError, OSError, ValueError, KeyError) as exc:
+        logger.warning("Could not read PDF bytes: %s", exc)
         return {"status": "error", "error_message": f"Could not read PDF: {exc}"}
     text = repair_pdf_text(text)
     if len(re.sub(r"\s", "", text)) < 50:  # little or no embedded text: a scan
@@ -123,8 +144,17 @@ def read_docx_bytes(data: bytes) -> dict:
             info = archive.getinfo("word/document.xml")
             if info.file_size > 20 * MAX_FILE_BYTES:  # zip-bomb guard
                 return {"status": "error", "error_message": "The .docx is too large once unpacked."}
-            root = ET.fromstring(archive.read(info))
+            raw_xml = archive.read(info)
+            # XXE / entity guard: reject files containing XML entity or DOCTYPE declarations
+            if re.search(rb"<!(?:DOCTYPE|ENTITY)\b", raw_xml, re.IGNORECASE):
+                logger.warning("Rejected .docx containing DOCTYPE/ENTITY declaration")
+                return {
+                    "status": "error",
+                    "error_message": "XML entity declarations (DOCTYPE/ENTITY) are not allowed in .docx files.",
+                }
+            root = ET.fromstring(raw_xml)
     except (zipfile.BadZipFile, KeyError, ET.ParseError) as exc:
+        logger.warning("Could not read .docx bytes: %s", exc)
         return {"status": "error", "error_message": f"Could not read .docx: {exc}"}
     lines = []
     for paragraph in root.iter(f"{_W}p"):
@@ -169,7 +199,10 @@ def unsupported_file_error(source: str):
     )):
         return {
             "status": "error",
-            "error_message": f"Unsupported file type: {os.path.basename(candidate)}. Use a PDF, .docx or .txt file, or paste the text.",
+            "error_message": (
+                f"Unsupported file type: {os.path.basename(candidate)}. "
+                "Use a PDF, .docx or .txt file, or paste the text."
+            ),
         }
     return None
 
@@ -180,20 +213,58 @@ def looks_like_path(source: str) -> bool:
     return candidate.lower().endswith(SUPPORTED_EXTENSIONS) and "\n" not in candidate
 
 
+def is_path_allowed(path: str) -> bool:
+    """Checks whether reading from the specified file path is permitted."""
+    if not config.allow_file_paths():
+        return False
+    allowed = config.get_allowed_folders()
+    if not allowed:
+        return True
+    try:
+        real_target = os.path.realpath(os.path.abspath(path))
+        for folder in allowed:
+            real_folder = os.path.realpath(os.path.abspath(folder))
+            if os.path.commonpath([real_folder, real_target]) == real_folder:
+                return True
+        return False
+    except (ValueError, OSError):
+        return False
+
+
 def read_path(source: str) -> dict:
-    """Reads a .pdf/.docx/.txt/.md file from disk."""
+    """Reads a .pdf/.docx/.txt/.md file from disk, enforcing security settings."""
+    if not config.allow_file_paths():
+        logger.warning("Rejected file path read because file path access is disabled")
+        return {
+            "status": "error",
+            "error_message": "Reading files by path is disabled. Upload the file or paste the text instead.",
+        }
+
     path = os.path.expanduser(source.strip().strip('"').strip("'"))
+    if not is_path_allowed(path):
+        logger.warning("Access denied: path %s is outside allowed directories", path)
+        return {
+            "status": "error",
+            "error_message": "Access denied: file path is outside allowed folders.",
+        }
+
     if not os.path.isfile(path):
         return {"status": "error", "error_message": f"File not found: {path}"}
     if os.path.getsize(path) > MAX_FILE_BYTES:
         return {"status": "error", "error_message": f"File is larger than {MAX_FILE_BYTES // 1_000_000} MB."}
+
+    logger.info("Reading document from file: %s", os.path.basename(path))
     with open(path, "rb") as f:
         return read_bytes(f.read(), os.path.splitext(path)[1])
 
 
 # --- PDF export --------------------------------------------------------------
 
-_ASCII = str.maketrans({"↔": "<->", "→": "->", "–": "-", "—": "-", "‘": "'", "’": "'", "“": '"', "”": '"', "•": "-", "…": "..."})
+_ASCII = str.maketrans({
+    "↔": "<->", "→": "->", "–": "-", "—": "-",
+    "‘": "'", "’": "'", "“": '"', "”": '"',
+    "•": "-", "…": "...",
+})
 
 
 def _pdf_escape(line: str) -> str:

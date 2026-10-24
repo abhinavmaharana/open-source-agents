@@ -4,6 +4,7 @@ from google.adk.agents import Agent
 from google.adk.models import Gemini
 from google.genai import types
 
+from . import config
 from .guardrails import after_agent_export, after_model_guardrail, before_model_guardrail
 from .tools import analyze_match, rank_job_descriptions
 
@@ -102,10 +103,9 @@ states that result; otherwise write the action and an [X%] placeholder.
 
 root_agent = Agent(
     name="resume_jd_match_agent",
-    # Retries handle the free tier's per-minute 429s; a daily quota error still fails.
     model=Gemini(
-        model="gemini-2.5-flash",
-        retry_options=types.HttpRetryOptions(attempts=3, initial_delay=10, max_delay=60),
+        model=config.MODEL_NAME,
+        retry_options=config.RETRY_OPTIONS,
     ),
     description=(
         "Compares a resume (PDF, .docx or text) with one or more job descriptions "
@@ -116,9 +116,9 @@ root_agent = Agent(
     instruction=INSTRUCTION,
     tools=[analyze_match, rank_job_descriptions],
     generate_content_config=types.GenerateContentConfig(
-        temperature=0.2,  # stable scores between runs
-        max_output_tokens=4096,
-        thinking_config=types.ThinkingConfig(thinking_budget=1024),  # caps hidden reasoning tokens
+        temperature=config.TEMPERATURE,
+        max_output_tokens=config.MAX_OUTPUT_TOKENS,
+        thinking_config=types.ThinkingConfig(thinking_budget=config.THINKING_BUDGET),
     ),
     before_model_callback=before_model_guardrail,
     after_model_callback=after_model_guardrail,

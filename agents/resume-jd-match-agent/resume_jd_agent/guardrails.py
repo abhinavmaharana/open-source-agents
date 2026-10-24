@@ -3,15 +3,15 @@
 None of these call the model, so they cost no requests or tokens:
 
 before_model_guardrail
-  - converts files uploaded in adk web (PDF, .docx, text) to text, wrapped in
-    delimiters so the model treats them as data, and stores them in session
-    state so tools can read them by name instead of the model copying the text;
+  - converts files uploaded in adk web (PDF, .docx, text) to text in background
+    threads, wrapped in delimiters so the model treats them as data, and stores
+    them in session state so tools can read them by name instead of copying text;
   - answers "no resume / no JD yet" messages itself, without calling Gemini;
   - stops runaway tool loops with a per-turn model-call cap;
   - fast path: when the message uses a documented format (an upload plus a
     pasted JD, two uploads, or "Resume: ... Job description: ..."), runs
-    analyze_match here and removes the tools, so the report takes ONE Gemini
-    call. Anything else falls back to the normal tool call;
+    analyze_match in a background thread and removes the tools, so the report
+    takes ONE Gemini call. Anything else falls back to the normal tool call;
   - report cache: the same resume + JD again returns the saved report with
     zero Gemini calls.
 
@@ -20,14 +20,16 @@ after_model_guardrail
     resume (compared by value, so 1.5k == 1,500) with [X] placeholders;
   - flags rewrites that claim a missing JD skill the original bullet lacks;
   - flags a report that is missing any of the five required sections;
-  - caches the report and queues it for export.
+  - caches the report in a background thread and queues it for export.
 
 after_agent_export
-  - saves the report or cover letter as a downloadable PDF artifact.
+  - saves the report or cover letter as a downloadable PDF artifact in a background thread.
 """
 
+import asyncio
 import functools
 import json
+import logging
 import re
 from typing import Optional
 
@@ -35,7 +37,7 @@ from google.adk.agents.callback_context import CallbackContext
 from google.adk.models import LlmRequest, LlmResponse
 from google.genai import types
 
-from . import cache
+from . import cache, config
 from .documents import markdown_to_pdf
 from .tools import (
     CACHE_KEY_STATE,
@@ -49,62 +51,63 @@ from .tools import (
     uploaded_file_to_text,
 )
 
+DOWNLOAD_PREFIX = config.DOWNLOAD_PREFIX
+EXPORT_STATE = config.EXPORT_STATE
+
+logger = logging.getLogger("resume_jd_agent.guardrails")
+
 # A report needs 1 model call on the fast path, 2 via a tool. Anything far
 # beyond that in one turn means the model is looping, so stop it.
-MAX_MODEL_CALLS_PER_TURN = 4
+MAX_MODEL_CALLS_PER_TURN = config.MAX_MODEL_CALLS_PER_TURN
 
 # First messages shorter than this, with no upload and no file path, cannot
 # contain both a resume and a JD, so we reply without calling Gemini.
-MIN_DOCS_CHARS = 300
+MIN_DOCS_CHARS = config.MIN_DOCS_CHARS
 
-REQUIRED_HEADINGS = [
-    "## 1. Match Score",
-    "## 2. Matched Skills",
-    "## 3. Missing Skills & Keywords",
-    "## 4. Bullet Rewrites",
-    "## 5. Top 3 Fixes Before Applying",
-]
-COVER_LETTER_HEADING = "## Cover Letter"
-
-ASK_FOR_INPUTS = (
-    "To build your match report I need two things:\n\n"
-    "1. **Your resume**: upload a PDF, .docx or .txt with the attach (+) button, give a "
-    "file path (e.g. `samples/sample_resume.txt`), or paste the text.\n"
-    "2. **The job description**: paste it, upload it, or give a file path. Several JDs? "
-    "Send them all and I will rank them.\n\n"
-    "Send both in one message to get the full report."
-)
+REQUIRED_HEADINGS = config.REQUIRED_HEADINGS
+COVER_LETTER_HEADING = config.COVER_LETTER_HEADING
+ASK_FOR_INPUTS = config.ASK_FOR_INPUTS
 
 
 def _text_response(text: str) -> LlmResponse:
     return LlmResponse(content=types.Content(role="model", parts=[types.Part(text=text)]))
 
 
-# temp: state lives for one turn; carries the finished report to after_agent_export.
-EXPORT_STATE = "temp:export"
-DOWNLOAD_PREFIX = "> Download:"
+def _input_label(source: str) -> str:
+    """Returns a short, privacy-safe label describing an input source without its content."""
+    s = (source or "").strip()
+    if s.startswith(UPLOAD_PREFIX):
+        return s
+    if "\n" in s or len(s) > 120:
+        return f"pasted text ({len(s)} chars)"
+    return f"file path ({s})"
 
 
 async def after_agent_export(callback_context: CallbackContext) -> Optional[types.Content]:
     """Saves this turn's report or cover letter as a downloadable PDF artifact.
 
-    Runs after the reply was sent, so the artifact lands in its own small event:
-    adk web shows an event that carries an artifact as the artifact instead of
-    its text, which would hide the formatted report. Never raises.
+    Runs after the reply was sent, offloading PDF generation to a worker thread.
+    Catches all unexpected exceptions so failures never crash the turn.
     """
-    export = callback_context.state.get(EXPORT_STATE)
-    if not export:
-        return None
-    filename = f"{export['name']}.pdf"
     try:
+        export = callback_context.state.get(EXPORT_STATE)
+        if not export:
+            return None
+        filename = f"{export['name']}.pdf"
+        pdf_bytes = await asyncio.to_thread(markdown_to_pdf, export["markdown"])
         await callback_context.save_artifact(
             filename,
-            types.Part.from_bytes(data=markdown_to_pdf(export["markdown"]), mime_type="application/pdf"),
+            types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
         )
-    except Exception:  # no artifact service or storage error: the report is still in the chat
+        callback_context.state[EXPORT_STATE] = None
+        logger.info("Saved export artifact: %s", filename)
+        return types.Content(
+            role="model",
+            parts=[types.Part(text=f"{DOWNLOAD_PREFIX} `{filename}` (Artifacts tab)")],
+        )
+    except Exception as exc:  # no artifact service or storage error: the report is still in chat
+        logger.exception("Unexpected error in after_agent_export: %s", exc)
         return None
-    callback_context.state[EXPORT_STATE] = None
-    return types.Content(role="model", parts=[types.Part(text=f"{DOWNLOAD_PREFIX} `{filename}` (Artifacts tab)")])
 
 
 # --- Input side --------------------------------------------------------------
@@ -117,8 +120,8 @@ def _upload_text(data: bytes, mime_type: str) -> tuple:
     return result["status"], result.get("text", ""), result.get("error_message", "")
 
 
-def _convert_uploads(callback_context: CallbackContext, llm_request: LlmRequest) -> list[str]:
-    """Replaces inline file parts with delimited text.
+async def _convert_uploads(callback_context: CallbackContext, llm_request: LlmRequest) -> list[str]:
+    """Replaces inline file parts with delimited text in worker threads.
 
     Returns the names of files uploaded in the LATEST user message.
     """
@@ -133,7 +136,9 @@ def _convert_uploads(callback_context: CallbackContext, llm_request: LlmRequest)
             if blob is None:
                 continue
             name = blob.display_name or f"file_{i + 1}"
-            status, text, error = _upload_text(blob.data or b"", (blob.mime_type or "").lower())
+            status, text, error = await asyncio.to_thread(
+                _upload_text, blob.data or b"", (blob.mime_type or "").lower()
+            )
             if status == "success":
                 if uploads.get(name) != text:
                     uploads[name] = text
@@ -195,9 +200,8 @@ async def _precompute(
 ) -> Optional[LlmResponse]:
     """Runs analyze_match in Python so the report needs at most ONE Gemini call.
 
-    Cached report -> returned with 0 calls. Unreadable file -> error returned
-    with 0 calls. Otherwise the analysis is added to the request and the tools
-    are removed, so Gemini writes the report straight away.
+    Offloads CPU/IO parsing and keyword analysis to a worker thread with asyncio.to_thread.
+    Cached report -> returned with 0 calls. Unreadable file -> error returned with 0 calls.
     """
     last = llm_request.contents[-1]
     if last.role != "user" or any(p.function_response for p in last.parts or []):
@@ -209,12 +213,20 @@ async def _precompute(
     if inputs is None:
         return None
 
-    result = analyze_match(inputs[0], inputs[1], callback_context)
+    logger.info(
+        "Fast path triggered for inputs (resume=%s, jd=%s)",
+        _input_label(inputs[0]),
+        _input_label(inputs[1]),
+    )
+    result = await asyncio.to_thread(analyze_match, inputs[0], inputs[1], callback_context)
     if result["status"] != "success":
+        logger.info("Fast path precompute document error: %s", result.get("error_message"))
         return _text_response(f"I couldn't read your documents: {result['error_message']}")
 
-    cached = cache.get(callback_context.state.get(CACHE_KEY_STATE))
+    cached_key = callback_context.state.get(CACHE_KEY_STATE)
+    cached = await asyncio.to_thread(cache.get, cached_key)
     if cached:
+        logger.info("Fast path served report from cache (key=%s)", (cached_key or "")[:12])
         callback_context.state[EXPORT_STATE] = {"name": "match_report", "markdown": cached}
         note = "> Served from the local report cache: 0 Gemini requests. Set `RESUME_JD_CACHE=off` to regenerate."
         return _text_response(f"{cached}\n\n{note}")
@@ -236,32 +248,41 @@ async def _precompute(
 async def before_model_guardrail(
     callback_context: CallbackContext, llm_request: LlmRequest
 ) -> Optional[LlmResponse]:
-    """Runs before every Gemini call. Returning a response skips the call."""
-    latest_uploads = _convert_uploads(callback_context, llm_request)
+    """Runs before every Gemini call. Returning a response skips the call.
 
-    # Loop guard: count model calls in this turn (temp: state is not persisted).
-    key = f"temp:model_calls:{callback_context.invocation_id}"
-    calls = callback_context.state.get(key, 0) + 1
-    callback_context.state[key] = calls
-    if calls > MAX_MODEL_CALLS_PER_TURN:
-        return _text_response(
-            "Stopped: this request needed more steps than expected. "
-            "Please send the resume and job description again in one message."
-        )
+    Protected by top-level try/except: unexpected errors log and let the turn carry on.
+    """
+    try:
+        latest_uploads = await _convert_uploads(callback_context, llm_request)
 
-    # Cheap-request guard: first message that cannot contain both documents.
-    if len(llm_request.contents) == 1 and not latest_uploads:
-        text = " ".join(p.text or "" for p in llm_request.contents[0].parts or [])
-        if len(text.strip()) < MIN_DOCS_CHARS and not _FILE_HINT_RE.search(text):
-            return _text_response(ASK_FOR_INPUTS)
+        # Loop guard: count model calls in this turn (temp: state is not persisted).
+        key = f"temp:model_calls:{callback_context.invocation_id}"
+        calls = callback_context.state.get(key, 0) + 1
+        callback_context.state[key] = calls
+        if calls > MAX_MODEL_CALLS_PER_TURN:
+            logger.warning("Replying locally: exceeded maximum model calls per turn (%d)", calls)
+            return _text_response(
+                "Stopped: this request needed more steps than expected. "
+                "Please send the resume and job description again in one message."
+            )
 
-    if calls == 1:
-        # Fast path: documented formats are analysed here, so one Gemini call suffices.
-        response = await _precompute(callback_context, llm_request, latest_uploads)
-        if response is not None or llm_request.config.tools is None:
-            return response
-        _attach_earlier_documents(callback_context, llm_request)
-    return None
+        # Cheap-request guard: first message that cannot contain both documents.
+        if len(llm_request.contents) == 1 and not latest_uploads:
+            text = " ".join(p.text or "" for p in llm_request.contents[0].parts or [])
+            if len(text.strip()) < MIN_DOCS_CHARS and not _FILE_HINT_RE.search(text):
+                logger.info("Replying locally: missing resume or job description inputs")
+                return _text_response(ASK_FOR_INPUTS)
+
+        if calls == 1:
+            # Fast path: documented formats are analysed here, so one Gemini call suffices.
+            response = await _precompute(callback_context, llm_request, latest_uploads)
+            if response is not None or llm_request.config.tools is None:
+                return response
+            _attach_earlier_documents(callback_context, llm_request)
+        return None
+    except Exception as exc:
+        logger.exception("Unexpected error in before_model_guardrail: %s", exc)
+        return None
 
 
 def _attach_earlier_documents(callback_context: CallbackContext, llm_request: LlmRequest) -> None:
@@ -290,7 +311,10 @@ _NUMBER_RE = re.compile(
     r"(\s?(?:%|x\b|k\b|K\b|m\b|M\b|mn\b|bn\b|B\b|million\b|thousand\b|billion\b))?"
     r"(?![\w\]%])"
 )
-_MULTIPLIERS = {"k": 1e3, "thousand": 1e3, "m": 1e6, "mn": 1e6, "million": 1e6, "b": 1e9, "bn": 1e9, "billion": 1e9}
+_MULTIPLIERS = {
+    "k": 1e3, "thousand": 1e3, "m": 1e6, "mn": 1e6, "million": 1e6,
+    "b": 1e9, "bn": 1e9, "billion": 1e9,
+}
 
 
 def _value(number: str, suffix: Optional[str]) -> float:
@@ -323,7 +347,8 @@ def _scrub_invented_numbers(text: str, resume_text: str, all_lines: bool = False
 
     lines = text.split("\n")
     for i, line in enumerate(lines):
-        if all_lines and not line.startswith("#") or line.lstrip().startswith("**After:**"):
+        # Operator precedence fix: unambiguous grouping
+        if (all_lines and not line.startswith("#")) or line.lstrip().startswith("**After:**"):
             lines[i] = _NUMBER_RE.sub(fix, line)
     return "\n".join(lines), replaced
 
@@ -352,41 +377,60 @@ def _unsupported_claims(report: str, missing_skills: list) -> list:
 async def after_model_guardrail(
     callback_context: CallbackContext, llm_response: LlmResponse
 ) -> Optional[LlmResponse]:
-    """Checks a finished report or cover letter before it reaches the user."""
-    if llm_response.partial or not llm_response.content or not llm_response.content.parts:
-        return None
-    text = "".join(p.text or "" for p in llm_response.content.parts if not p.thought)
-    is_report = "## 1. Match Score" in text
-    is_letter = COVER_LETTER_HEADING in text
-    if not (is_report or is_letter):
-        return None  # a question, tool call or error message
+    """Checks a finished report or cover letter before it reaches the user.
 
-    resume_text = callback_context.state.get(RESUME_STATE_KEY, "")
-    notes = []
-    if resume_text:
-        text, replaced = _scrub_invented_numbers(text, resume_text, all_lines=is_letter and not is_report)
-        if replaced:
-            notes.append(
-                f"{replaced} number(s) were not in your resume and were replaced with [X] "
-                "placeholders. Fill in your real figures."
-            )
-    if is_report:
-        for number, skills in _unsupported_claims(text, callback_context.state.get(MISSING_STATE_KEY, []) or []):
-            notes.append(
-                f"Rewrite {number} adds {', '.join(skills)}, which your resume does not show. "
-                "Only keep it if it is true, and add evidence elsewhere in your resume."
-            )
-        missing = [h for h in REQUIRED_HEADINGS if h not in text]
-        if missing:
-            notes.append("This report is missing sections: " + ", ".join(missing) + ". Ask again to regenerate.")
-    if notes:
-        text += "\n\n---\n" + "\n".join(f"> {n}" for n in notes)
+    Protected by top-level try/except: unexpected errors log and let the turn carry on.
+    """
+    try:
+        if llm_response.partial or not llm_response.content or not llm_response.content.parts:
+            return None
+        text = "".join(p.text or "" for p in llm_response.content.parts if not p.thought)
+        is_report = "## 1. Match Score" in text
+        is_letter = COVER_LETTER_HEADING in text
+        if not (is_report or is_letter):
+            return None  # a question, tool call or error message
 
-    if is_report and "## 0. JD Ranking" not in text:
-        cache.put(callback_context.state.get(CACHE_KEY_STATE), text)
-    # The PDF is saved by after_agent_export, in its own event (see there).
-    callback_context.state[EXPORT_STATE] = {"name": "match_report" if is_report else "cover_letter", "markdown": text}
+        resume_text = callback_context.state.get(RESUME_STATE_KEY, "")
+        notes = []
+        if resume_text:
+            text, replaced = _scrub_invented_numbers(text, resume_text, all_lines=is_letter and not is_report)
+            if replaced:
+                notes.append(
+                    f"{replaced} number(s) were not in your resume and were replaced with [X] "
+                    "placeholders. Fill in your real figures."
+                )
+        claims = []
+        if is_report:
+            claims = _unsupported_claims(text, callback_context.state.get(MISSING_STATE_KEY, []) or [])
+            for number, skills in claims:
+                notes.append(
+                    f"Rewrite {number} adds {', '.join(skills)}, which your resume does not show. "
+                    "Only keep it if it is true, and add evidence elsewhere in your resume."
+                )
+            missing = [h for h in REQUIRED_HEADINGS if h not in text]
+            if missing:
+                notes.append("This report is missing sections: " + ", ".join(missing) + ". Ask again to regenerate.")
+        if notes:
+            text += "\n\n---\n" + "\n".join(f"> {n}" for n in notes)
 
-    # Edit in place so usage metadata and other response fields are kept.
-    llm_response.content = types.Content(role="model", parts=[types.Part(text=text)])
-    return llm_response
+        if is_report and "## 0. JD Ranking" not in text:
+            cache_key = callback_context.state.get(CACHE_KEY_STATE)
+            if cache_key:
+                await asyncio.to_thread(cache.put, cache_key, text)
+
+        callback_context.state[EXPORT_STATE] = {
+            "name": "match_report" if is_report else "cover_letter",
+            "markdown": text,
+        }
+
+        logger.info(
+            "After-model guardrail processed response (is_report=%s, is_letter=%s, notes=%d)",
+            is_report,
+            is_letter,
+            len(notes),
+        )
+        llm_response.content = types.Content(role="model", parts=[types.Part(text=text)])
+        return llm_response
+    except Exception as exc:
+        logger.exception("Unexpected error in after_model_guardrail: %s", exc)
+        return llm_response
